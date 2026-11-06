@@ -37,6 +37,13 @@ through `Sources/Cra/App/CraCoreExports.swift`.
 5. **Run `scripts/test.sh` before a PR.** CI runs it as well, with the coverage gates in
    docs/testing.md.
 
+## Sidebar panes
+
+The sidebar deliberately draws Pinned and Today as two independent scroll panes, unlike Arc's
+one list. Read [docs/sidebar-two-panes.md](docs/sidebar-two-panes.md) before merging upstream
+work under `UI/Sidebar/List/`: the invariants there are easy to undo by taking upstream's single
+`SpaceListView` wholesale.
+
 ## Known exceptions
 
 This logic is pure enough for CraCore but still lives in the app. Move a piece when a change

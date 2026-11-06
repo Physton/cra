@@ -6,8 +6,10 @@ extension NSPasteboard.PasteboardType {
     static let craSidebarItem = NSPasteboard.PasteboardType(UTType.craSidebarItem.identifier)
 }
 
-/// A space's pinned and Today list, drawn by AppKit like Arc's sidebar (an AppKit list of
-/// cells), not SwiftUI. Scrolling moves one clip view; nothing is laid out or diffed per frame.
+/// One scrolling list of a space, drawn by AppKit like Arc's sidebar (an AppKit list of cells),
+/// not SwiftUI. The sidebar stacks the pinned tabs and Today as two of these panes (`.pinned`,
+/// `.today`), each with its own clip view; the Spaces page keeps Arc's one list (`.all`).
+/// Scrolling moves one clip view; nothing is laid out or diffed per frame.
 /// The list reads the store inside an observation scope, rebuilds its flat row models when
 /// anything it read changes (once per run loop turn), and hands each row view a new model only
 /// when it differs. Hover is one tracking area for the whole list, so scrolling under a resting
@@ -46,6 +48,9 @@ final class SpaceListView: NSView, NSDraggingSource {
     }
 
     let spaceID: UUID
+    /// Which rows this list draws. `.all` is Arc's one list (the Spaces page); the sidebar's
+    /// two panes build only their own section.
+    let scope: SidebarListScope
     /// The column's header: the list's menu opens the icon picker on it and renames there.
     weak var header: SpaceHeaderView?
     let store: SidebarStore
@@ -77,6 +82,23 @@ final class SpaceListView: NSView, NSDraggingSource {
     private var syncQueued = false
     private var synced = false
     private var laidOutWidth: CGFloat = -1
+    /// The rows' height at the current width, including the pane's top inset. The column sizes
+    /// the pinned pane from this and gives Today the rest.
+    private(set) var measuredContentHeight: CGFloat = 0
+    /// The column re-sizes both panes when a list's rows change height.
+    var onContentHeightChange: (() -> Void)?
+    /// Today's top padding in its own pane: 0 under the divider, 1 pt with the divider hidden
+    /// (Today empty), matching what the one-list layout leaves there. Ignored by `.all`.
+    var contentTopInset: CGFloat = 0 { didSet { if contentTopInset != oldValue { contentInsetChanged() } } }
+    /// A legacy scroller's 8 pt gutter, decided by the column so both panes' rows line up.
+    /// nil: this list decides (the Spaces page's one list).
+    var rowsInset: CGFloat? {
+        didSet {
+            guard rowsInset != oldValue else { return }
+            relayoutIfResized()
+            needsLayout = true
+        }
+    }
     private weak var hovered: SidebarRowView?
     private weak var tipTarget: (any ArcTooltipTarget)?
     /// While the list scrolls, rows slide under the pointer: no tips until it has rested.
@@ -100,8 +122,9 @@ final class SpaceListView: NSView, NSDraggingSource {
     /// Arc's Spaces page lists a space's tabs without the New Tab row.
     var showsNewTab = true { didSet { if showsNewTab != oldValue { scheduleSync() } } }
 
-    init(spaceID: UUID, store: SidebarStore, ui: SidebarUIState, actions: SidebarActions, favicons: FaviconCache) {
+    init(spaceID: UUID, scope: SidebarListScope = .all, store: SidebarStore, ui: SidebarUIState, actions: SidebarActions, favicons: FaviconCache) {
         self.spaceID = spaceID
+        self.scope = scope
         self.store = store
         self.ui = ui
         self.actions = actions
@@ -116,7 +139,9 @@ final class SpaceListView: NSView, NSDraggingSource {
         scrollView.autohidesScrollers = true
         scrollView.hasHorizontalScroller = false
         scrollView.horizontalScrollElasticity = .none
-        scrollView.verticalScrollElasticity = .allowed
+        // The panes scroll on their own: the pinned pane's edges are inside the column, so a
+        // bounce there would open a gap at the divider. Today keeps the list's end bounce.
+        scrollView.verticalScrollElasticity = scope == .pinned ? .none : .allowed
         scrollView.automaticallyAdjustsContentInsets = false
         document.list = self
         document.wantsLayer = true
@@ -173,7 +198,24 @@ final class SpaceListView: NSView, NSDraggingSource {
     }
 
     /// Arc's rows give up 8 pt to a legacy scroller, none to an overlay one.
-    private var rowsWidth: CGFloat { legacyScrollerShown ? bounds.width - 8 : bounds.width }
+    private var rowsWidth: CGFloat { bounds.width - (rowsInset ?? (legacyScrollerShown ? 8 : 0)) }
+
+    /// A pane's top padding: the one-list layout leaves 3 pt, then its row gap, above the first
+    /// pinned row; Today's first row sits at the divider's bottom.
+    private var paneTopInset: CGFloat {
+        switch scope {
+        case .pinned: return rows.isEmpty ? 3 : 4
+        case .today: return rows.isEmpty ? 0 : contentTopInset
+        case .all: return 3
+        }
+    }
+
+    private func contentInsetChanged() {
+        layoutRows()
+        placeViews(animated: false, fresh: [], gone: [])
+        materialize()
+        needsLayout = true
+    }
 
     @objc private func relayoutIfResized() {
         guard rowsWidth != laidOutWidth else { return }
@@ -212,7 +254,9 @@ final class SpaceListView: NSView, NSDraggingSource {
         guard let space = store.space(spaceID) else { return nil }
         let palette = space.theme.palette
         let window = ui.windowID
-        let drop = ui.listDrop
+        // A drop belongs to the pane that resolved it; the other pane shows no preview.
+        let drop = ui.listDrop?.scope == scope ? ui.listDrop : nil
+        let dragging = ui.draggingID
         let picks = ui.multiSelection
         let renaming = ui.renamingID
         let focusID = ui.keyboardFocusID
@@ -326,29 +370,40 @@ final class SpaceListView: NSView, NSDraggingSource {
             }
         }
 
-        let pinnedKids = store.item(space.pinnedContainerID)?.children ?? []
-        let pinnedItems = store.listedPinnedItems(in: space, window: window)
-        for item in pinnedItems {
-            add(item, depth: 0, pinned: true, parent: space.pinnedContainerID, index: pinnedKids.firstIndex(of: item.id) ?? 0)
+        var pinnedKids: [UUID] = []
+        var pinnedItems: [SidebarItem] = []
+        if scope != .today {
+            pinnedKids = store.item(space.pinnedContainerID)?.children ?? []
+            pinnedItems = store.listedPinnedItems(in: space, window: window)
+            for item in pinnedItems {
+                add(item, depth: 0, pinned: true, parent: space.pinnedContainerID, index: pinnedKids.firstIndex(of: item.id) ?? 0)
+            }
         }
         let section = dropSection(drop)
         // With nothing pinned the list takes no room; a drag opens a real target. Not when
         // collapsed: the placeholder would claim an empty list and open under the pointer,
-        // taking drops meant for the top of Today.
-        if pinnedKids.isEmpty && drop != nil {
+        // taking drops meant for the top of Today. A pane has to open as soon as a drag starts
+        // anywhere, before the pointer can enter a 0 pt list.
+        let wantsPlaceholder = pinnedKids.isEmpty && (drop != nil || (scope == .pinned && dragging != nil))
+        if scope != .today && wantsPlaceholder {
             out.append(Row(key: .placeholder, content: .placeholder(active: section == .pinned)))
         }
         let pinnedCount = out.count
-        let todayKids = store.item(space.todayContainerID)?.children ?? []
-        let tidy: DividerTidy = store.tidyingSpaces.contains(spaceID) ? .running
-            : TidyTabsService.shared.offers(spaceID, store: store) ? .offered : .none
-        out.append(Row(key: .divider, content: .divider(hasToday: !todayKids.isEmpty, tidy: tidy)))
-        let atTop = store.settings.newTabButtonAtTop
-        if atTop && showsNewTab { out.append(Row(key: .newTab, content: .newTab(active: placeholder))) }
-        for item in store.children(of: space.todayContainerID) {
-            add(item, depth: 0, pinned: false, parent: space.todayContainerID, index: todayKids.firstIndex(of: item.id) ?? 0)
+        if scope == .all {
+            let todayKids = store.item(space.todayContainerID)?.children ?? []
+            let tidy: DividerTidy = store.tidyingSpaces.contains(spaceID) ? .running
+                : TidyTabsService.shared.offers(spaceID, store: store) ? .offered : .none
+            out.append(Row(key: .divider, content: .divider(hasToday: !todayKids.isEmpty, tidy: tidy)))
         }
-        if !atTop && showsNewTab { out.append(Row(key: .newTab, content: .newTab(active: placeholder))) }
+        if scope != .pinned {
+            let todayKids = store.item(space.todayContainerID)?.children ?? []
+            let atTop = store.settings.newTabButtonAtTop
+            if atTop && showsNewTab { out.append(Row(key: .newTab, content: .newTab(active: placeholder))) }
+            for item in store.children(of: space.todayContainerID) {
+                add(item, depth: 0, pinned: false, parent: space.todayContainerID, index: todayKids.firstIndex(of: item.id) ?? 0)
+            }
+            if !atTop && showsNewTab { out.append(Row(key: .newTab, content: .newTab(active: placeholder))) }
+        }
         return Built(rows: out, pinnedCount: pinnedCount, palette: palette,
                      highlightPinned: section == .pinned && !pinnedItems.isEmpty, highlightToday: section == .today,
                      line: drop?.line)
@@ -529,6 +584,14 @@ final class SpaceListView: NSView, NSDraggingSource {
     /// pinned row (41 pt) under the last pinned tab, and Cra's line left an 18 pt gap there
     /// (reported on X, 2 Nov 2026, with the pinned tabs collapsed).
     private func layoutRows() {
+        if scope == .all {
+            layoutAllRows()
+        } else {
+            layoutPaneRows()
+        }
+    }
+
+    private func layoutAllRows() {
         let width = rowsWidth
         let inner = max(0, width - 2 * CraMetrics.rowInset)
         var y: CGFloat = 3
@@ -547,19 +610,76 @@ final class SpaceListView: NSView, NSDraggingSource {
                 continue
             }
             if !(afterLine && i == pinnedCount + 1) { y += CraMetrics.rowSpacing }
-            let h: CGFloat
-            if case .liveStatus(let m) = rows[i].content { h = LiveStatusRowView.height(m, width: inner) } else { h = CraMetrics.rowHeight }
+            let h = rowHeight(rows[i], inner: inner)
             rows[i].frame = NSRect(x: CraMetrics.rowInset, y: y, width: inner, height: h)
             y += h
         }
         let todayTop = rows.indices.contains(pinnedCount) ? rows[pinnedCount].frame.maxY : y
         todayFrame = NSRect(x: CraMetrics.rowInset, y: todayTop, width: inner, height: max(0, y - todayTop))
         contentBottom = y
+        measuredContentHeight = y
         let height = max(y + 121, scrollView.contentView.bounds.height)
+        setDocument(width: width, height: height)
+    }
+
+    /// One pane's rows: no divider, no list after it. Pinned rows keep the one-list layout's
+    /// 3 pt inset plus its first row gap; Today starts at the divider's bottom.
+    private func layoutPaneRows() {
+        let width = rowsWidth
+        let inner = max(0, width - 2 * CraMetrics.rowInset)
+        var y = paneTopInset
+        for i in 0..<rows.count {
+            if i > 0 { y += CraMetrics.rowSpacing }
+            let h = rowHeight(rows[i], inner: inner)
+            rows[i].frame = NSRect(x: CraMetrics.rowInset, y: y, width: inner, height: h)
+            y += h
+        }
+        if scope == .pinned {
+            pinnedFrame = NSRect(x: CraMetrics.rowInset, y: 0, width: inner, height: y)
+            todayFrame = .zero
+        } else {
+            todayFrame = NSRect(x: CraMetrics.rowInset, y: 0, width: inner, height: y)
+            pinnedFrame = .zero
+        }
+        contentBottom = y
+        // The pinned pane ends where its rows do; only Today keeps Arc's ~121 pt of empty list
+        // after the New Tab row.
+        let tail: CGFloat = scope == .pinned ? 0 : 121
+        setDocument(width: width, height: max(y + tail, scrollView.contentView.bounds.height))
+        reportContentHeight(y)
+    }
+
+    private func rowHeight(_ row: Row, inner: CGFloat) -> CGFloat {
+        if case .liveStatus(let m) = row.content { return LiveStatusRowView.height(m, width: inner) }
+        return CraMetrics.rowHeight
+    }
+
+    private func setDocument(width: CGFloat, height: CGFloat) {
         let docWidth = legacyScrollerShown ? scrollView.contentView.frame.width : width
         if document.frame.size != NSSize(width: docWidth, height: height) {
             document.frame = NSRect(x: 0, y: 0, width: docWidth, height: height)
         }
+    }
+
+    /// The column watches this to size the pane. `.all` is the Spaces page's one list, sized by
+    /// its card, so only a pane reports.
+    private func reportContentHeight(_ y: CGFloat) {
+        let changed = abs(y - measuredContentHeight) > 0.01
+        measuredContentHeight = y
+        if changed, scope != .all { onContentHeightChange?() }
+    }
+
+    /// The height these rows take at `width`, without laying the pane out first. The column
+    /// sizes the pinned pane from this before it decides where the divider and Today go.
+    func contentHeight(forWidth width: CGFloat) -> CGFloat {
+        let inset = rowsInset ?? (legacyScrollerShown ? 8 : 0)
+        let inner = max(0, width - inset - 2 * CraMetrics.rowInset)
+        var y = paneTopInset
+        for i in 0..<rows.count {
+            if i > 0 { y += CraMetrics.rowSpacing }
+            y += rowHeight(rows[i], inner: inner)
+        }
+        return y
     }
 
     private func placed(_ row: Row) -> NSRect { row.frame.offsetBy(dx: 0, dy: row.decor.nudge) }
@@ -665,6 +785,11 @@ final class SpaceListView: NSView, NSDraggingSource {
     /// Dia's TabOverflowGeometryTracker: the pill shows while the selected row is wholly
     /// past an edge of the visible list, at that edge.
     private func updateJumpPill(animated: Bool) {
+        // A short pinned pane has no room for the capsule without covering its only rows.
+        guard bounds.height >= 2 * CraMetrics.rowHeight else {
+            jumpPill.show(edge: nil, icons: [], animated: false)
+            return
+        }
         let visible = scrollView.contentView.bounds
         var edge: SidebarJumpPill.Edge?
         var tabs: [UUID] = []
@@ -935,14 +1060,18 @@ final class SpaceListView: NSView, NSDraggingSource {
 
     func dragExited() {
         autoscroller.stop()
-        if ui.listDrop != nil { ui.listDrop = nil }
+        // Entering the other pane sends this list an exit after that pane resolved its drop;
+        // the fixed band between the panes owns its own drop too.
+        if let drop = ui.listDrop, drop.scope == scope, !drop.fromDivider { ui.listDrop = nil }
     }
 
     func performDrop(_ info: NSDraggingInfo) -> Bool {
         autoscroller.stop()
         guard let id = ui.draggingID, store.item(id) != nil else { return false }
         let point = document.convert(info.draggingLocation, from: nil)
-        let drop = ui.listDrop ?? resolve(dragged: id, at: point)
+        // The drop belongs to this pane only when it resolved it; otherwise resolve here.
+        let own = ui.listDrop.flatMap { $0.scope == scope && !$0.fromDivider ? $0 : nil }
+        let drop = own ?? resolve(dragged: id, at: point)
         ui.listDrop = nil
         applyDrop(drop)
         // A click whose pointer slipped 3 pt became a drag; let go on its own row it is still a
@@ -960,7 +1089,8 @@ final class SpaceListView: NSView, NSDraggingSource {
         return true
     }
 
-    private func applyDrop(_ drop: SidebarListDrop) {
+    /// Applies a drop another view resolved (the divider between the two panes).
+    func applyDrop(_ drop: SidebarListDrop) {
         let id = drop.draggedID
         // A picked tab carries the other picks along (a split still takes one pane).
         let group = ui.group(for: id, in: store)
@@ -996,7 +1126,7 @@ final class SpaceListView: NSView, NSDraggingSource {
     /// takes the item, a Today tab makes a split (the dragged tab goes on the side of the row
     /// it hovers), a pinned tab makes a new folder, a split row takes a pane.
     func resolve(dragged id: UUID, at p: CGPoint) -> SidebarListDrop {
-        guard let space = store.space(spaceID) else { return SidebarListDrop(draggedID: id) }
+        guard let space = store.space(spaceID) else { return SidebarListDrop(draggedID: id, scope: scope) }
         let items = rows.filter { $0.itemID != nil }
         let group = ui.group(for: id, in: store)
         let isTab = store.item(id)?.isTab == true
@@ -1024,7 +1154,7 @@ final class SpaceListView: NSView, NSDraggingSource {
             } else {
                 target = f < 0.5 ? before : after
             }
-        } else {
+        } else if scope == .all {
             // Between sections or past the last row: the divider splits pinned from today.
             if p.y < (pinnedFrame.maxY + todayFrame.minY) / 2 {
                 target = .insert(parent: space.pinnedContainerID, index: p.y < pinnedFrame.minY ? 0 : store.children(of: space.pinnedContainerID).count)
@@ -1033,6 +1163,14 @@ final class SpaceListView: NSView, NSDraggingSource {
                 let firstToday = items.first { $0.parent == space.todayContainerID }?.frame.minY ?? todayFrame.minY
                 target = .insert(parent: space.todayContainerID, index: p.y < firstToday ? 0 : store.children(of: space.todayContainerID).count)
             }
+        } else if scope == .pinned {
+            // Past this pane's last row: the top of the pane prepends, below appends.
+            let first = items.first?.frame.minY ?? pinnedFrame.minY
+            target = .insert(parent: space.pinnedContainerID, index: p.y < first ? 0 : store.children(of: space.pinnedContainerID).count)
+        } else {
+            // The New Tab row may lead Today, so its first tab, not the pane, marks the top.
+            let firstToday = items.first { $0.parent == space.todayContainerID }?.frame.minY ?? todayFrame.minY
+            target = .insert(parent: space.todayContainerID, index: p.y < firstToday ? 0 : store.children(of: space.todayContainerID).count)
         }
 
         // Dropping next to itself, or a folder into itself, changes nothing.
@@ -1052,7 +1190,7 @@ final class SpaceListView: NSView, NSDraggingSource {
         default: break
         }
 
-        var drop = SidebarListDrop(draggedID: id, target: target)
+        var drop = SidebarListDrop(draggedID: id, scope: scope, target: target)
         guard case .insert(let parent, let index)? = target else { return drop }
         let kids = store.item(parent)?.children ?? []
         var y: CGFloat?
@@ -1067,7 +1205,8 @@ final class SpaceListView: NSView, NSDraggingSource {
         guard let y else { return drop }
         // A group's tabs sit at its header's depth (Arc doesn't indent them).
         let depth = items.first { $0.itemID == parent }.map { $0.depth + (store.item(parent)?.isTabGroup == true ? 0 : 1) } ?? 0
-        drop.line = .init(y: y, minX: todayFrame.minX + CraMetrics.rowLeading + CGFloat(depth) * CraMetrics.indent, maxX: todayFrame.maxX - 6)
+        let line = scope == .pinned ? pinnedFrame : todayFrame
+        drop.line = .init(y: y, minX: line.minX + CraMetrics.rowLeading + CGFloat(depth) * CraMetrics.indent, maxX: line.maxX - 6)
         drop.rowAbove = items.last { $0.frame.maxY <= y + 1 }?.itemID
         drop.rowBelow = items.first { $0.frame.minY >= y - 1 }?.itemID
         return drop

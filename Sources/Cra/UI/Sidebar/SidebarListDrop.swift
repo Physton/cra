@@ -1,5 +1,14 @@
 import AppKit
 
+/// Which list a drop belongs to. The sidebar draws the pinned tabs and Today as two panes, so
+/// each pane only shows the insertion line its own list resolved; the Spaces page draws them
+/// as one list (`.all`).
+enum SidebarListScope: Equatable {
+    case all
+    case pinned
+    case today
+}
+
 /// What releasing a sidebar drag over the space's list would do right now. The
 /// rows read it to draw the live preview (insertion line, rows easing apart,
 /// the row a drop would combine with) and SpaceListView applies it on drop.
@@ -21,6 +30,11 @@ struct SidebarListDrop: Equatable {
     }
 
     var draggedID: UUID
+    /// The list that resolved the drop.
+    var scope: SidebarListScope = .all
+    /// The fixed band between the panes resolved it, not a pane: a pane's drag exit must not
+    /// clear it when the pointer leaves that pane for the band.
+    var fromDivider = false
     /// nil while the drop would leave the item where it is.
     var target: Target?
     /// Insertion line in the list's coordinate space.
