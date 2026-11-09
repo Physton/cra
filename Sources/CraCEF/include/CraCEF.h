@@ -13,6 +13,13 @@ typedef NS_ENUM(NSInteger, CraDownloadState) {
     CraDownloadStateInterrupted = 3,
 };
 
+/// Where a page's context menu opens a link that isn't for a tab.
+typedef NS_ENUM(NSInteger, CraLinkWindow) {
+    CraLinkWindowNew = 0,
+    CraLinkWindowIncognito = 1,
+    CraLinkWindowLittle = 2,
+};
+
 @interface CraDownloadInfo : NSObject
 @property (nonatomic) uint32_t identifier;
 @property (nonatomic, copy) NSString *url;
@@ -81,6 +88,14 @@ typedef NS_ENUM(NSInteger, CraDownloadState) {
 - (void)browserDidReceiveFocus:(CraBrowser *)browser;
 - (void)browserDidClose:(CraBrowser *)browser;
 @optional
+/// The page's context menu: Open Link in New Window, Little Window or Incognito Window.
+- (void)browser:(CraBrowser *)browser requestsWindowWithURL:(NSString *)url kind:(CraLinkWindow)kind;
+/// The page's context menu: Open Link in Split View, a pane beside this page (#257). Without it
+/// the menu has no such item (a Little Window's page).
+- (void)browser:(CraBrowser *)browser requestsSplitPaneWithURL:(NSString *)url;
+/// The page's context menu on an image: Capture Image… at `point` (page points from the top
+/// left). Without it the menu has no such item.
+- (void)browser:(CraBrowser *)browser requestsCaptureOfImageAt:(NSPoint)point;
 /// A video of this page entered or left Chromium's Picture in Picture window
 /// (whether the page, the user or Cra asked for it).
 - (void)browser:(CraBrowser *)browser didChangePictureInPicture:(BOOL)active;
@@ -98,6 +113,9 @@ typedef NS_ENUM(NSInteger, CraDownloadState) {
 - (void)browser:(CraBrowser *)browser didChangeMediaCapture:(BOOL)capturing;
 /// The page started or stopped playing sound (see `isAudible`).
 - (void)browser:(CraBrowser *)browser didChangeAudible:(BOOL)audible;
+/// The page's sound started or stopped as it happened, before the 2 s that `isAudible` and
+/// `browser:didChangeAudible:` hold a quiet page audible.
+- (void)browser:(CraBrowser *)browser didChangeSoundPlaying:(BOOL)playing;
 /// `hasCommittedLoad` changed: the main frame committed, or a new navigation started.
 - (void)browser:(CraBrowser *)browser didChangeCommittedLoad:(BOOL)committed;
 /// The page's main-frame load failed with a net error (ERR_ABORTED, a navigation cut off,
@@ -136,6 +154,11 @@ typedef NS_ENUM(NSInteger, CraDownloadState) {
 /// NO from the start of a main-frame navigation until it commits (the server answered and the
 /// new page began to load), YES after.
 @property (nonatomic, readonly) BOOL hasCommittedLoad;
+/// The address the main frame is navigating to, redirects followed (OnBeforeBrowse); what a
+/// page still waiting for its answer is waiting for (GitHub #256). nil before the first.
+@property (nonatomic, readonly, copy, nullable) NSString *navigatingURL;
+/// Main-frame navigations started (not redirects): another one restarts a wait.
+@property (nonatomic, readonly) NSInteger navigationStarts;
 @property (nonatomic, readonly) BOOL canGoBack;
 @property (nonatomic, readonly) BOOL canGoForward;
 @property (nonatomic, readonly) BOOL isCreated;
@@ -207,6 +230,9 @@ typedef NS_ENUM(NSInteger, CraDownloadState) {
 - (void)skipPictureInPictureBy:(double)seconds NS_SWIFT_NAME(skipPictureInPicture(by:));
 - (void)print;
 - (void)viewSource;
+/// One of Chrome's own commands by its IDC name ("IDC_ROUTE_MEDIA" for Cast…, "IDC_TASK_MANAGER"),
+/// where Chromium can run it for this page. NO when it can't.
+- (BOOL)runChromeCommand:(NSString *)name NS_SWIFT_NAME(runChromeCommand(_:));
 - (void)executeJavaScript:(NSString *)script;
 /// Asks the page for its background colour again (-browser:didReportBackgroundColor:);
 /// pages can switch themes without a load.
@@ -239,8 +265,6 @@ typedef NS_ENUM(NSInteger, CraDownloadState) {
 /// DevTools) instead of embedded Alloy views. Set before any browser exists.
 + (void)setChromeHosting:(BOOL)enabled;
 + (BOOL)chromeHosting;
-/// Page context menus are shown by Cra, not Chrome (pages embedded in their cards).
-+ (void)setOwnContextMenus:(BOOL)enabled;
 /// The two "open link" items at the top of a page's context menu, in order: their titles and
 /// whether each opens its tab in the background. Exactly two; read when a menu opens.
 + (void)setLinkMenuTitles:(NSArray<NSString *> *)titles opensInBackground:(NSArray<NSNumber *> *)background;
@@ -258,6 +282,11 @@ typedef NS_ENUM(NSInteger, CraDownloadState) {
 /// http:// navigations are upgraded, and a site without HTTPS shows Chrome's warning
 /// page before it loads. Profiles that load later get it too. Off until enabled.
 + (void)setHttpsOnlyModeEnabled:(BOOL)enabled;
+/// Arc's View ▸ Appearance ("Websites, Easels, and Notes will use:"): 0 Automatic (the Mac's),
+/// 1 Light, 2 Dark. Chrome's colour mode in every profile, which pages' prefers-color-scheme and
+/// Chrome's own pages follow; profiles that load later get it too.
++ (void)setWebsiteAppearance:(NSInteger)mode;
+@property (class, nonatomic, readonly) NSInteger websiteAppearance;
 /// Chromium's secure DNS setting (chrome://settings/security), app-wide in Local State:
 /// `dns_over_https.mode` and `dns_over_https.templates` as Chromium holds them now. nil
 /// before Chromium is ready and once quitting starts.
@@ -312,6 +341,11 @@ typedef NS_ENUM(NSInteger, CraDownloadState) {
 /// ("Default", "Profile <id>"; nil off the record); Chrome's own window for it is closed.
 /// Popup-type windows (windows.create({type: "popup"})) stay Chrome's windows.
 + (void)setStrayPageHandler:(void (^)(NSString *url, NSString * _Nullable profile))handler;
+/// A new tab or window a page asks for (target=_blank, window.open) at another app's address
+/// (spotify:): the handler gets the page's browser, the address and whether a click asked, and
+/// returns YES when it took it (Cra's "Open <app>?"); then no tab opens (GitHub #207). On the
+/// main thread, before Peek and the delegate's popupHostForURL.
++ (void)setAppLinkHandler:(BOOL (^)(CraBrowser *browser, NSString *url, BOOL userGesture))handler;
 /// Where a page's download is saved (GitHub #190): the handler gets the browser's profile folder
 /// (nil for Default and off the record) and the file name Chromium suggests, and calls `completion`
 /// on the main thread with the full path to save to, or nil to cancel the download (a save panel

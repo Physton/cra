@@ -29,12 +29,13 @@ final class WebKitBrowser: CraBrowser, WKNavigationDelegate, WKUIDelegate, WKDow
     private var closed = false
     private var pageClosedItself = false
     private var committed = false
+    /// The page's own navigation to another app's address asked already (decidePolicyFor).
+    private var askedForAppOnThisPage = false
     private var lastStatus = 0
     private var lastLoadingState: [Bool] = []
     private var observations: [NSKeyValueObservation] = []
     private var observesPlayingAudio = false
-    private var playing = false
-    private var audible = false
+    private var audibleHold = AudibleHold()
     private var audibleOff: DispatchWorkItem?
     private var capturing = false
     /// The service this page opened for ("Spotify"), kept while it signs in elsewhere: what the
@@ -219,7 +220,7 @@ final class WebKitBrowser: CraBrowser, WKNavigationDelegate, WKUIDelegate, WKDow
     override var isInPictureInPicture: Bool { inPictureInPicture }
     override var isPictureInPicturePlaying: Bool { pictureInPicturePlaying }
     override var isCapturingMedia: Bool { capturing }
-    override var isAudible: Bool { audible }
+    override var isAudible: Bool { audibleHold.audible }
 
     /// Once per change of the three, as CEF's OnLoadingStateChange (each of them is observed).
     @MainActor
@@ -240,26 +241,26 @@ final class WebKitBrowser: CraBrowser, WKNavigationDelegate, WKUIDelegate, WKDow
         delegate?.browser?(self, didChangeMediaCapture: now)
     }
 
-    /// Chrome's audible state: on as sound starts, off 2 s after it stops.
+    /// Chrome's audible state: on as sound starts, off 2 s after it stops (AudibleHold).
     @MainActor
     private func setPlaying(_ now: Bool) {
-        playing = now
         audibleOff?.cancel()
         audibleOff = nil
-        if now {
-            guard !audible else { return }
-            audible = true
+        delegate?.browser?(self, didChangeSoundPlaying: now)
+        switch audibleHold.setPlaying(now) {
+        case .announce:
             delegate?.browser?(self, didChangeAudible: true)
-        } else if audible {
+        case .holdThenQuiet:
             let work = DispatchWorkItem { [weak self] in
                 MainActor.assumeIsolated {
-                    guard let self, !self.playing, self.audible, !self.closed else { return }
-                    self.audible = false
+                    guard let self, !self.closed, self.audibleHold.quietEnded() else { return }
                     self.delegate?.browser?(self, didChangeAudible: false)
                 }
             }
             audibleOff = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + AudibleHold.quiet, execute: work)
+        case .nothing:
+            break
         }
     }
 
@@ -311,12 +312,17 @@ final class WebKitBrowser: CraBrowser, WKNavigationDelegate, WKUIDelegate, WKDow
         if action.shouldPerformDownload { return decisionHandler(.download, preferences) }
         guard let url = action.request.url else { return decisionHandler(.allow, preferences) }
         let scheme = url.scheme?.lowercased() ?? ""
-        // mailto:, zoommtg:, itms-apps: go to their app, only from a click.
         // A web page never opens local files (Chromium's rule; Cra's own file:// pages are Chromium's).
         if scheme == "file" { return decisionHandler(.cancel, preferences) }
         if !["http", "https", "about", "blob", "data"].contains(scheme) {
-            // mailto:, zoommtg:, itms-apps: go to their app from a click, after Chrome's "Open <app>?".
-            if action.navigationType == .linkActivated { confirmOpeningApp(for: url) }
+            // zoommtg:, spotify:, itms-apps: go to their app after Chrome's "Open <app>?". A click
+            // asks each time; the page's own redirect (Spotify's "open in the app" when a link
+            // to it opens) asks once per page it loads, from the main frame, as Chrome's flood
+            // guard lets it.
+            let click = action.navigationType == .linkActivated
+            let redirect = !click && action.targetFrame?.isMainFrame == true && !askedForAppOnThisPage
+            if redirect { askedForAppOnThisPage = true }
+            AppLinkPrompt.handle(url.absoluteString, from: self, userGesture: click || redirect)
             return decisionHandler(.cancel, preferences)
         }
         guard action.navigationType == .linkActivated else { return decisionHandler(.allow, preferences) }
@@ -339,21 +345,6 @@ final class WebKitBrowser: CraBrowser, WKNavigationDelegate, WKUIDelegate, WKDow
         decisionHandler(.allow, preferences)
     }
 
-    /// Chrome's external protocol dialog: the app the link wants, named, before macOS opens it.
-    @MainActor
-    private func confirmOpeningApp(for url: URL) {
-        guard let app = NSWorkspace.shared.urlForApplication(toOpen: url), let window = container.window else { return }
-        let name = FileManager.default.displayName(atPath: app.path).replacingOccurrences(of: ".app", with: "")
-        let alert = NSAlert()
-        alert.messageText = "Open \(name)?"
-        alert.informativeText = "\(webView?.url?.host ?? "This site") wants to open this application."
-        alert.addButton(withTitle: "Open \(name)")
-        alert.addButton(withTitle: "Cancel")
-        alert.beginSheetModal(for: window) { response in
-            if response == .alertFirstButtonReturn { NSWorkspace.shared.open(url) }
-        }
-    }
-
     func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse,
                  decisionHandler: @escaping @MainActor (WKNavigationResponsePolicy) -> Void) {
         let http = response.response as? HTTPURLResponse
@@ -368,6 +359,7 @@ final class WebKitBrowser: CraBrowser, WKNavigationDelegate, WKUIDelegate, WKDow
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        askedForAppOnThisPage = false
         setCommitted(true)
     }
 
@@ -419,6 +411,9 @@ final class WebKitBrowser: CraBrowser, WKNavigationDelegate, WKUIDelegate, WKDow
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for action: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
         let url = action.request.url?.absoluteString ?? ""
+        // Another app's address (Spotify's "Open in Desktop app" #207): no tab, "Open <app>?" over
+        // this page. WebKit asks here only for a click (javaScriptCanOpenWindowsAutomatically is off).
+        if AppLinkPrompt.handle(url, from: self, userGesture: true) { return nil }
         // A target=_blank link: a new tab without an opener, like Chrome's noopener default.
         if action.navigationType == .linkActivated {
             let mods = action.modifierFlags

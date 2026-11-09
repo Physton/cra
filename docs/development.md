@@ -18,7 +18,8 @@ Notes for working on the code. How to send a change is in
 you.
 
 Requirements: macOS 14+ on Apple silicon, Xcode 16+, CMake (`brew install cmake`), about
-1 GB of disk for CEF and the build products.
+1 GB of disk for CEF and the build products. `CRA_ARCH=x86_64 scripts/build.sh` cross-compiles the
+Intel app into `build/x86_64/Cra.app` (another ~1 GB); every release ships both.
 
 `scripts/fetch-cef.sh` pins the CEF version and downloads it into `vendor/cef` (not
 committed). It fetches Cra's own CEF build, made by `scripts/build-cef.sh` with H.264/AAC
@@ -67,13 +68,14 @@ the save panel.
 
     scripts/test.sh                  # everything below except the smoke test, in seconds
     scripts/test.sh core             # only Packages/CraCore
+    scripts/test-folder-glyph.sh      # folder emblems: layer projection, colors and Retina resolution
     Tests/smoke-launch.sh            # launches build/Cra.app three times, about 30 s
     scripts/scenario.sh all          # user journeys in build/Cra.app, about 6 minutes
     scripts/scenario.sh sleep-tabs   # one of them (Tests/Scenarios/<name>.scenario)
     scripts/coverage.py              # line coverage, and the changed-lines gate against origin/main
     scripts/coverage.py --base <ref> # the same against another base (CI passes the PR's)
     scripts/fuzz.sh                  # mutated importer fixtures under AddressSanitizer
-    scripts/mutate.py [word]         # mutation testing of the pure code, minutes; a word limits it
+    scripts/mutate.py [word]         # mutation testing of the pure code, about an hour; a word limits it
 
 [testing.md](testing.md) has the rules, the layers, the gates and how to write a scenario.
 
@@ -97,6 +99,9 @@ to Markdown or `docs/` alone runs nothing.
   `ManualScheduler`, against the made-up Arc and Chromium profiles in `Tests/Fixtures`.
 - `scripts/test-policies.sh`: the decisions pulled out of the window controllers
   (`ExtensionLaunch`, `DevToolsToggle`, `FeatureFlags`).
+- `scripts/test-folder-glyph.sh`: the standalone folder component's real AppKit layers and image
+  pixels: emblems follow the front panel's perspective, keep their colors and proportions, and
+  update at 1x/Retina. No CEF or visible window; coverage uses the same harness as `scripts/test.sh`.
 - `scripts/test-perf.sh`: the performance recorder on a real main run loop: injected stalls,
   hang files with a `sample` stack, the session marker, ownership, the recording switch
   ([performance.md](performance.md)).
@@ -117,7 +122,9 @@ Cra were in front or behind, e.g. the download bin's dimming), `windowSize=1280x
 memory-pressure sweep at that level, if Settings ▸ Tabs has it on), `stall=<ms>` (blocks the main
 thread), `perfReport=<path>` (the recorder's perf.json now), `systemAppearance=light|dark|system`
 (the appearance Auto space themes follow, without changing the Mac's), `themeEditor=1` (Edit
-Theme Color… for the focused space), `relaunch=1`, `quit=1`, and `nowPlaying=state|toggle|next|previous|pip|dismiss` (the sidebar player's
+Theme Color… for the focused space), `sidebarShown=<label>` (whether the window shows its sidebar,
+and the View menu's Hide/Show Sidebar row: its title and the key it answers to, an App Shortcut's
+when one names it), `relaunch=1`, `quit=1`, and `nowPlaying=state|toggle|next|previous|pip|dismiss` (the sidebar player's
 newest card, then a `Cra nowPlaying[<label>] <host> playing=… prev=… next=… video=… pip=…` line per card
 on stdout; `&label=` tells checks apart).
 
@@ -167,6 +174,13 @@ download's file name by hand; `CRA_TIDY_FAKE_MODEL=off` (or `preparing`, `inelig
 without Apple Intelligence would. `cra://debug?tidy=1` runs Tidy on the window's space without
 hovering the divider, `cra://debug?undoTidy=1` is ⌘Z's undo and `cra://debug?settingsPane=max`
 opens Settings on a pane.
+
+`cra://debug?dragEnd=<text>` ends a drag of the window's tab whose URL holds the text, let go
+with nothing taking it, the way a drag out of the sidebar ends: outside every Cra window it opens
+in a new Blank Window (`&at=x,y` picks the point, from the screen's top left).
+`cra://debug?blankMoveTo=<n>` picks the nth space in the Blank Window's "Move to…".
+`cra://debug?browserWindows=<label>` logs each browser window's kind (normal, blank, incognito),
+space, tabs, open tab and frame; cra.log gets the kinds and counts only.
 
 `cra://debug?menuAt=315,24` opens the menu a click at that window point would open (the
 developer-mode ⌄ here), and `&button=right` the context menu, a tab row's for instance.
@@ -239,7 +253,7 @@ renders of them (so the multiply blends survive) used by `BrandMark`, and
 ## Releasing
 
 `scripts/release.sh` builds, signs with a Developer ID, notarizes, and packages a DMG and
-zip into `build/dist`. Pushing a `v*` tag runs the same through GitHub Actions and
+zip into `build/dist`, for Apple silicon and Intel. Pushing a `v*` tag runs the same through GitHub Actions and
 publishes a release. Releases with UI changes get short clips on the release notes first
 (`scripts/clips`, `.claude/skills/release-clips`). See [release.md](release.md) for the
 one-time certificate setup.

@@ -1,20 +1,63 @@
-import Foundation
+import AppKit
 
-/// The decisions pulled out of the window controllers: what an extension click does, the
-/// DevTools toggle and the feature flags (the toolbar's buttons moved to CraCore). Table tests,
-/// no AppKit views.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private(set) var openedURLs: [URL] = []
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        openedURLs.append(contentsOf: urls)
+    }
+}
+
+/// App policies tested without browser windows or Chromium.
 @main
 enum PolicyTests {
     private static var checks = 0
 
     @MainActor
-    static func main() {
+    static func main() throws {
         extensionLaunch()
         devToolsToggle()
         featureFlags()
+        try webHandoff()
         print("Policies: \(checks) checks passed")
     }
 
+    @MainActor
+    private static func webHandoff() throws {
+        let plist = try Data(contentsOf: URL(fileURLWithPath: "resources/Info.plist"))
+        let info = try PropertyListSerialization.propertyList(from: plist, format: nil) as? [String: Any]
+        expect((info?["NSUserActivityTypes"] as? [String])?.contains(NSUserActivityTypeBrowsingWeb) == true,
+               "macOS can offer Cra for web Handoff")
+
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        let receiver = AppDelegate()
+        let delegate: NSApplicationDelegate = receiver
+        let web = NSUserActivity(activityType: NSUserActivityTypeBrowsingWeb)
+        let other = NSUserActivity(activityType: "com.example.other")
+        expect(delegate.application?(app, willContinueUserActivityWithType: web.activityType) == true, "accept a web Handoff")
+        expect(delegate.application?(app, willContinueUserActivityWithType: other.activityType) == false, "decline unrelated activities")
+
+        func resume(_ activity: NSUserActivity) -> Bool? {
+            delegate.application?(app, continue: activity, restorationHandler: { _ in })
+        }
+        expect(resume(web) == false, "a missing webpage cannot be continued")
+        web.webpageURL = URL(string: "https:/missing-host")
+        expect(resume(web) == false, "a web address without a host is ignored")
+        let urls = ["http://example.test/", "https://example.test/a%20b?q=1#part"].map { URL(string: $0)! }
+        other.webpageURL = urls[0]
+        expect(resume(other) == false, "a webpage on an unrelated activity is ignored")
+        for url in urls {
+            web.webpageURL = url
+            expect(resume(web) == true, "continue a handed-off web page")
+        }
+        expect(receiver.openedURLs == urls, "only the accepted pages reach normal URL opening, once each and intact")
+    }
+
+    /// #41: a click never reaches an extension turned off in chrome://extensions (Chromium crashed
+    /// on it). #22: nor one the page's profile doesn't have; that click does nothing.
+    // promise: #22 #41
     private static func extensionLaunch() {
         typealias E = ExtensionLaunch.Extension
         let popup = E(id: "pop", popupPath: "popup.html", optionsPath: "options.html")
@@ -36,6 +79,10 @@ enum PolicyTests {
                "neither: Chrome's details page for it")
     }
 
+    // promise: #88 #138
+    /// DevTools' toggle, and the developer bar's Console, Network and Inspect as Chrome runs them (#88).
+    /// #138: the developer bar's Console and Network switch open DevTools to their panel and close
+    /// them only when that panel already shows; a press while they open picks the panel.
     private static func devToolsToggle() {
         var t = DevToolsToggle()
         expect(t.toggle() == .show && t.state == .opening, "closed: a press opens")

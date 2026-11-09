@@ -310,7 +310,8 @@ final class SpaceListView: NSView, NSDraggingSource {
                     tabCount: expanded ? 0 : store.tabs(under: item.id).count,
                     liveBusy: refreshing.contains(item.id), liveError: item.liveFolder.flatMap(LiveFolderText.warning)?.help,
                     liveSignInURL: item.liveFolder.flatMap(LiveFolderText.warning)?.signInURL,
-                    liveHelp: LiveFolderText.refreshHelp(item.liveFolder)))
+                    liveHelp: LiveFolderText.refreshHelp(item.liveFolder), liveSource: item.liveFolder?.source,
+                    symbol: item.folderSymbol))
                 out.append(row)
                 guard expanded else {
                     // Arc keeps the open tab of a closed folder in sight, one level in (FolderPeek).
@@ -324,13 +325,15 @@ final class SpaceListView: NSView, NSDraggingSource {
                 for c in store.children(of: item.id) {
                     add(c, depth: depth + 1, pinned: pinned, parent: item.id, index: kids.firstIndex(of: c.id) ?? 0)
                 }
-                if item.isLiveFolder, let m = Self.liveStatus(item) {
+                if item.isLiveFolder, let m = Self.liveStatus(item, hasTabs: !store.tabs(under: item.id).isEmpty) {
                     out.append(Row(key: .liveStatus(item.id), content: .liveStatus(LiveStatusModel(text: m.text, url: m.url, depth: depth + 1))))
                 }
             } else if let tab = item.tab {
                 let selected = store.isSelected(item.id, window: window)
                 let navigatedAway = pinned && tab.url != tab.savedURL && !tab.savedURL.isEmpty
-                let (img, flip) = icon(tab.iconKey)
+                // An easel's row has an easel glyph, not a favicon (Arc's EaselCellView).
+                let (img, flip) = Easel.id(fromURL: tab.url) != nil && tab.customIconKey == nil
+                    ? (NSImage(systemSymbolName: "pencil.and.scribble", accessibilityDescription: "Easel"), false) : icon(tab.iconKey)
                 let (homeImg, homeFlip) = navigatedAway ? icon(tab.customIconKey ?? FaviconKey.key(for: tab.savedURL)) : (img, flip)
                 let developerMode = store.settings.isDeveloperMode(url: tab.url)
                 // Tidy Tab Titles' rename: "Double-click to rename" under the new name for a few seconds.
@@ -338,18 +341,19 @@ final class SpaceListView: NSView, NSDraggingSource {
                 let subtitle = tidyRename != nil ? TidyTitlesService.subtitle : tab.sidebarSubtitle(developerMode: developerMode)
                 // Arc's tidy titles: a known site's page shows a shorter title unless the tab has a name.
                 let title = item.title == nil ? TidyTitleRules.arc.tidy(item.displayTitle, url: tab.url) : item.displayTitle
+                let liveSource = tab.liveItemURL != nil && tab.customIconKey == nil ? store.liveFolder(containing: parent)?.liveFolder?.source : nil
                 row.content = .tab(TabRowModel(
                     id: item.id, depth: depth, pinned: pinned, title: title, customTitle: item.title != nil,
                     renameText: item.title ?? title, subtitle: subtitle,
-                    icon: img, flipIcon: flip, githubMark: tab.liveItemURL != nil && tab.customIconKey == nil,
+                    icon: img, flipIcon: flip, githubMark: liveSource == .github,
                     editing: renaming == item.id, selected: selected,
                     highlighted: picks.isEmpty ? selected && !placeholder : picks.contains(item.id),
                     capturing: capturing.contains(item.id), audible: audible.contains(item.id), muted: tab.muted, unread: item.isUnread,
                     navigatedAway: navigatedAway,
                     focusRing: focusID == item.id, developerMode: developerMode, peeked: peeked,
                     homeIcon: homeImg, homeFlipIcon: homeFlip,
-                    peekIcon: ui.peekBadge?.tabID == item.id ? icon(ui.peekBadge?.iconKey).0 : nil,
-                    tidyRename: tidyRename))
+                    peekIcon: ui.peekBadges[item.id].flatMap { icon($0.iconKey).0 },
+                    tidyRename: tidyRename, gitlabMark: liveSource == .gitlab))
                 out.append(row)
             } else if item.isSplit {
                 let children = store.children(of: item.id).filter(\.isTab)
@@ -370,11 +374,13 @@ final class SpaceListView: NSView, NSDraggingSource {
             }
         }
 
+        // A Blank Window's sidebar is its tabs only: no pinned section, no line (Arc, #220).
+        let blank = store.isBlank(space: spaceID)
         var pinnedKids: [UUID] = []
         var pinnedItems: [SidebarItem] = []
         if scope != .today {
-            pinnedKids = store.item(space.pinnedContainerID)?.children ?? []
-            pinnedItems = store.listedPinnedItems(in: space, window: window)
+            pinnedKids = blank ? [] : store.item(space.pinnedContainerID)?.children ?? []
+            pinnedItems = blank ? [] : store.listedPinnedItems(in: space, window: window)
             for item in pinnedItems {
                 add(item, depth: 0, pinned: true, parent: space.pinnedContainerID, index: pinnedKids.firstIndex(of: item.id) ?? 0)
             }
@@ -384,19 +390,18 @@ final class SpaceListView: NSView, NSDraggingSource {
         // collapsed: the placeholder would claim an empty list and open under the pointer,
         // taking drops meant for the top of Today. A pane has to open as soon as a drag starts
         // anywhere, before the pointer can enter a 0 pt list.
-        let wantsPlaceholder = pinnedKids.isEmpty && (drop != nil || (scope == .pinned && dragging != nil))
+        let wantsPlaceholder = pinnedKids.isEmpty && !blank && (drop != nil || (scope == .pinned && dragging != nil))
         if scope != .today && wantsPlaceholder {
             out.append(Row(key: .placeholder, content: .placeholder(active: section == .pinned)))
         }
         let pinnedCount = out.count
+        let todayKids = store.item(space.todayContainerID)?.children ?? []
+        let tidy: DividerTidy = blank ? .none : store.tidyingSpaces.contains(spaceID) ? .running
+            : TidyTabsService.shared.offers(spaceID, store: store) ? .offered : .none
         if scope == .all {
-            let todayKids = store.item(space.todayContainerID)?.children ?? []
-            let tidy: DividerTidy = store.tidyingSpaces.contains(spaceID) ? .running
-                : TidyTabsService.shared.offers(spaceID, store: store) ? .offered : .none
-            out.append(Row(key: .divider, content: .divider(hasToday: !todayKids.isEmpty, tidy: tidy)))
+            out.append(Row(key: .divider, content: .divider(hasToday: !todayKids.isEmpty && !blank, tidy: tidy)))
         }
         if scope != .pinned {
-            let todayKids = store.item(space.todayContainerID)?.children ?? []
             let atTop = store.settings.newTabButtonAtTop
             if atTop && showsNewTab { out.append(Row(key: .newTab, content: .newTab(active: placeholder))) }
             for item in store.children(of: space.todayContainerID) {
@@ -411,8 +416,17 @@ final class SpaceListView: NSView, NSDraggingSource {
 
     /// A line inside the open live folder when there are no pull requests to show, or GitHub
     /// can't be read (Arc: "Sign back in to GitHub.", "Login with SSO to unlock this folder").
-    private static func liveStatus(_ item: SidebarItem) -> (text: String, url: String?)? {
-        guard let live = item.liveFolder, item.children.isEmpty else { return nil }
+    private static func liveStatus(_ item: SidebarItem, hasTabs: Bool) -> (text: String, url: String?)? {
+        guard let live = item.liveFolder, !hasTabs else { return nil }
+        // GitLab: the GitHub folder's lines, in GitLab's words.
+        if live.source == .gitlab {
+            switch live.lastError {
+            case .notSignedIn?: return ("Sign back in to GitLab.", live.signInURL)
+            case .some: return ("We’re having trouble connecting to GitLab; click here to see your Merge Requests.",
+                                live.serverURL.map { "\($0)/dashboard/merge_requests" })
+            case nil: return live.lastFetch == nil ? nil : ("Merge requests from you and your team will show up here automatically", nil)
+            }
+        }
         switch live.lastError {
         case .notSignedIn?: return ("Sign back in to GitHub.", live.signInURL)
         case .some: return ("We’re having trouble connecting to GitHub; click here to see your Pull Requests.", "https://github.com/pulls")
@@ -823,6 +837,13 @@ final class SpaceListView: NSView, NSDraggingSource {
         }
     }
 
+    func showFolderIconPicker(_ id: UUID) {
+        guard let row = views[.item(id)] as? FolderRowView, let item = store.item(id) else { return }
+        FolderIconPicker.show(current: item.folderSymbol, anchor: row, rect: row.iconRect) { [store] symbol in
+            store.setFolderSymbol(symbol, for: id)
+        }
+    }
+
     /// Scrolls the selected tab to the middle of the list (as far as the list allows).
     private func scrollToSelected() {
         guard let (row, _) = selectedRow() else { return }
@@ -930,6 +951,12 @@ final class SpaceListView: NSView, NSDraggingSource {
         hoverAt(inside && document.isMouseInside ? p : nil)
     }
 
+    /// Scenarios (cra://debug?hover=): `row` takes the hover as if the pointer were on its middle.
+    /// The pointer's next move, or the list's next sync, puts it back where the pointer is.
+    func debugHover(_ row: SidebarRowView) {
+        hoverAt(row.convert(NSPoint(x: row.bounds.midX, y: row.bounds.midY), to: nil))
+    }
+
     private func hoverAt(_ windowPoint: NSPoint?) {
         var target: SidebarRowView?
         var local = NSPoint.zero
@@ -945,11 +972,6 @@ final class SpaceListView: NSView, NSDraggingSource {
             hovered?.isHovered = false
             hovered = target
             target?.isHovered = true
-            if let t = target as? TabRowView, let id = t.model?.id {
-                if ui.hoveredTabID != id { ui.hoveredTabID = id }
-            } else if let h = ui.hoveredTabID, views[.item(h)] != nil {
-                ui.hoveredTabID = nil
-            }
             FolderPreviewController.shared.hover(target, in: self)
         }
         target?.hoverMoved(to: local)
@@ -960,6 +982,15 @@ final class SpaceListView: NSView, NSDraggingSource {
     }
 
     // MARK: Clicks
+
+    /// The tab whose sidebar row is under a mouse event, if any: a split row's panes, a page and
+    /// everything else that isn't a tab row give nil.
+    static func tabID(under event: NSEvent) -> UUID? {
+        guard let content = event.window?.contentView else { return nil }
+        let root = content.superview ?? content
+        guard let hit = root.hitTest(root.convert(event.locationInWindow, from: nil)) else { return nil }
+        return sequence(first: hit, next: \.superview).lazy.compactMap { ($0 as? TabRowView)?.model?.id }.first
+    }
 
     func clickTab(_ id: UUID, event: NSEvent) {
         let flags = event.modifierFlags.intersection([.command, .shift])
@@ -1019,8 +1050,30 @@ final class SpaceListView: NSView, NSDraggingSource {
         context == .withinApplication ? [.move, .copy, .generic, .private] : []
     }
 
+    /// Outside every Cra window a tab doesn't slide back to its row: let go, it opens there (#219).
+    func draggingSession(_ session: NSDraggingSession, movedTo screenPoint: NSPoint) {
+        let back = Self.isOverAppWindow(screenPoint)
+        if session.animatesToStartingPositionsOnCancelOrFail != back { session.animatesToStartingPositionsOnCancelOrFail = back }
+    }
+
+    /// Whether the window under a screen point, any app's, is one of Cra's.
+    static func isOverAppWindow(_ point: NSPoint) -> Bool {
+        let n = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
+        return n > 0 && NSApp.window(withWindowNumber: n) != nil
+    }
+
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        dragEnded(ui.draggingID, at: screenPoint, operation: operation)
+    }
+
+    /// A row's drag is over (`cra://debug?dragEnd` ends one the same way).
+    func dragEnded(_ dragged: UUID?, at screenPoint: NSPoint, operation: NSDragOperation) {
         autoscroller.stop()
+        // Let go outside every Cra window where nothing took it: Arc opens the tab in a Blank Window there.
+        if let id = dragged, TabTearOff.tearsOff(isTab: store.item(id)?.isTab == true, incognito: store.isIncognito(item: id),
+                                                       dropAccepted: !operation.isEmpty, overAppWindow: Self.isOverAppWindow(screenPoint)) {
+            actions.tearOffTab(id, screenPoint)
+        }
         ui.draggingID = nil
         // The drag switched spaces; picks don't outlive leaving their space.
         if store.focusedSpaceID(window: ui.windowID) != spaceID { ui.clearPicks() }
@@ -1074,6 +1127,12 @@ final class SpaceListView: NSView, NSDraggingSource {
         let drop = own ?? resolve(dragged: id, at: point)
         ui.listDrop = nil
         applyDrop(drop)
+        // From another window's space (a Blank Window's, or across windows and spaces): the tab
+        // leaves the window that showed it and opens here; this window comes forward, so its page
+        // moves in at once.
+        let before = store.selectedTabID(window: ui.windowID)
+        for t in ui.group(for: id, in: store) where store.item(t)?.isTab == true { store.tookTab(t, into: ui.windowID) }
+        if store.selectedTabID(window: ui.windowID) != before { window?.makeKeyAndOrderFront(nil) }
         // A click whose pointer slipped 3 pt became a drag; let go on its own row it is still a
         // click, so the tab opens (GitHub #7: "a single click on a tab sometimes did nothing").
         if drop.target == nil, store.item(id)?.isTab == true, ui.multiSelection.count <= 1,
@@ -1098,7 +1157,8 @@ final class SpaceListView: NSView, NSDraggingSource {
         case .insert(let parent, let index)?:
             store.moveItems(group, to: parent, index: index)
         case .split(let tab, let leading)?:
-            store.createSplit(with: leading ? [id, tab] : [tab, id], at: tab)
+            // Arc opens the tab a drag picks up, so the new split ends up open on its pane (#180).
+            if store.combineIntoSplit(id, onto: tab, leading: leading) != nil { store.selectTab(id, window: ui.windowID) }
         case .into(let target)?:
             if store.item(target)?.isFolder == true {
                 store.moveItems(group, to: target, index: nil)
@@ -1123,8 +1183,8 @@ final class SpaceListView: NSView, NSDraggingSource {
     }
 
     /// Top and bottom quarters of a row insert before/after it; the middle combines: a folder
-    /// takes the item, a Today tab makes a split (the dragged tab goes on the side of the row
-    /// it hovers), a pinned tab makes a new folder, a split row takes a pane.
+    /// takes the item, a tab, pinned or not, makes a split in its place (the dragged tab goes on
+    /// the side of the row it hovers), a split row takes a pane.
     func resolve(dragged id: UUID, at p: CGPoint) -> SidebarListDrop {
         guard let space = store.space(spaceID) else { return SidebarListDrop(draggedID: id, scope: scope) }
         let items = rows.filter { $0.itemID != nil }
@@ -1146,8 +1206,8 @@ final class SpaceListView: NSView, NSDraggingSource {
                 else if f >= 0.75 { target = store.isExpanded(rid) ? .insert(parent: rid, index: 0) : after }
                 else { target = .into(rid) }
             } else if middle && isTab && item.isTab {
-                // Arc combines two tabs into a split wherever the target sits (#191): a pinned
-                // one stays pinned and the split opens in Today with a copy of it.
+                // Arc combines two tabs into a split wherever the target sits (#191), in the
+                // target's place: on a pinned tab it is a pinned split (#180).
                 target = .split(with: rid, leading: p.x < r.frame.midX)
             } else if middle && isTab && item.isSplit {
                 target = .into(rid)
@@ -1156,7 +1216,7 @@ final class SpaceListView: NSView, NSDraggingSource {
             }
         } else if scope == .all {
             // Between sections or past the last row: the divider splits pinned from today.
-            if p.y < (pinnedFrame.maxY + todayFrame.minY) / 2 {
+            if p.y < (pinnedFrame.maxY + todayFrame.minY) / 2, !store.isBlank(space: spaceID) {
                 target = .insert(parent: space.pinnedContainerID, index: p.y < pinnedFrame.minY ? 0 : store.children(of: space.pinnedContainerID).count)
             } else {
                 // The New Tab row may lead Today, so its first tab, not the section, marks the top.
@@ -1184,9 +1244,9 @@ final class SpaceListView: NSView, NSDraggingSource {
 
         // A live folder fills itself: nothing goes into it from outside, and its tabs make no new folders.
         switch target {
-        case .into(let f)? where store.item(f)?.isLiveFolder == true: target = nil
-        case .insert(let parent, _)? where store.item(parent)?.isLiveFolder == true && store.item(id)?.parentID != parent: target = nil
-        case .split(let tab, _)? where store.item(store.item(tab)?.parentID ?? tab)?.isLiveFolder == true: target = nil
+        case .into(let f)? where store.liveFolder(containing: f) != nil: target = nil
+        case .insert(let parent, _)? where store.liveFolder(containing: parent) != nil && store.item(id)?.parentID != parent: target = nil
+        case .split(let tab, _)? where store.liveFolder(containing: tab) != nil: target = nil
         default: break
         }
 

@@ -4,6 +4,13 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<!-- British English for the system's own menu items (Summarise, Colours) where macOS
+	     prefers it, as in Arc; Cra's own words stay as they are. -->
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>en-GB</string>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>Cra</string>
 	<key>CFBundleIdentifier</key>
@@ -29,6 +36,10 @@
 	<string>14.0</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
+	<key>NSAppleScriptEnabled</key>
+	<true/>
+	<key>OSAScriptingDefinition</key>
+	<string>Cra.sdef</string>
 	<key>NSPrincipalClass</key>
 	<string>CraApplication</string>
 	<key>NSHighResolutionCapable</key>
@@ -59,6 +70,10 @@
 	     name over mDNS instead of handing the page this Mac's local IP address. -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Video calls and other web sites can connect to devices on your network, like someone on the same Wi-Fi or your router's settings page.</string>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>NSUserActivityTypeBrowsingWeb</string>
+	</array>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
