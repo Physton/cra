@@ -16,6 +16,7 @@ struct TabsPane: View {
                 SettingsCheckbox(title: "Preview a folder’s tabs when hovering over it", isOn: $store.settings.folderPreviews)
                 // Arc: Settings ▸ General ▸ Previews (Gmail's unread mail on its favorite).
                 SettingsCheckbox(title: "Preview unread Gmail when hovering its favorite", isOn: $store.settings.favoritePreviews)
+                SettingsCheckbox(title: "Outline the open favorite in its logo’s colors", isOn: $store.settings.favoriteLogoOutline)
                 SettingsCheckbox(title: "Show toolbar above the page", isOn: $store.settings.showToolbar)
                 SettingsCheckbox(title: "Pages fill the window edge to edge", isOn: $store.settings.edgeToEdgeContent)
                 SettingsCheckbox(title: "Enable Picture in Picture when you leave a video tab", isOn: $store.settings.autoPictureInPicture)
@@ -54,9 +55,9 @@ struct TabsPane: View {
                     .disabled(!store.settings.peekLinksToOtherSites)
                     .padding(.leading, 20)
                 SettingsCheckbox(title: "Open a Peek window when clicking on links with Shift held", isOn: $store.settings.peekOnShiftClick)
-                // GitHub #183, Chrome's way and not Arc's: the page stays in front.
-                SettingsCheckbox(title: "Open links in new tabs in the background", isOn: $store.settings.openLinksInBackground)
-                Text("“Open Link in New Tab” keeps the page you’re reading in front. “Open Link in Foreground Tab” and ⇧⌘-click still switch to the new tab.")
+                // Off as in Arc, whose "Open Link in New Tab" keeps the page in front (#276).
+                SettingsCheckbox(title: "“Open Link in New Tab” switches to the new tab", isOn: $store.settings.openLinksInForeground)
+                Text("Off, the page you’re reading stays in front, as in Arc. ⌘-click opens a link behind the page and ⇧⌘-click switches to it, whatever this says.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {
