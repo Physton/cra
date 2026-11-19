@@ -2,8 +2,10 @@ import AppKit
 import SwiftUI
 
 /// One space's page in the pager: Arc's favorites grid and space header, fixed, over the
-/// space's tab list, which scrolls (Arc 1.170). All AppKit: a space switch or swipe moves this
-/// view's layer and nothing in it lays out or re-renders.
+/// space's tabs. Cra keeps the pinned tabs and Today in two panes that scroll on their own,
+/// above and below a fixed divider, where Arc scrolls one list (a deliberate departure). The
+/// pinned pane takes its content's height, up to a share of the column; Today gets the rest.
+/// All AppKit: a space switch or swipe moves this view's layer and nothing in it lays out.
 @MainActor
 final class SpaceColumnView: NSView {
     let spaceID: UUID
@@ -13,9 +15,27 @@ final class SpaceColumnView: NSView {
     private let favicons: FaviconCache
     private let favorites: FavoritesGridView
     private let header: SpaceHeaderView
-    private let list: SpaceListView
+    private let pinnedList: SpaceListView
+    private let todayList: SpaceListView
+    private let divider: SidebarSectionDividerView
     /// How far SpacePagerView holds the favorites left of their place (see holdFavorites).
     private var favoritesShift: CGFloat = 0
+    private var lastHasToday: Bool?
+    /// The stored dragged height the last DividerState carried, to re-place on another space's drag.
+    private var lastStoredPaneHeight: Double?
+    /// The tallest the pins may be dragged to: the last place()'s room less Today's one row.
+    private var paneDragLimit: CGFloat = 0
+    /// The height a drag has set so far; its release writes it to the window prefs.
+    private var draggedPinnedHeight: CGFloat?
+    private var placing = false
+
+    private struct DividerState: Equatable {
+        var hasToday: Bool
+        var tidy: DividerTidy
+        var colors: SidebarColors
+        /// The height a drag left in the window prefs: every space's column follows it.
+        var pinnedPaneHeight: Double?
+    }
 
     init(spaceID: UUID, store: SidebarStore, ui: SidebarUIState, actions: SidebarActions, favicons: FaviconCache) {
         self.spaceID = spaceID
@@ -23,17 +43,32 @@ final class SpaceColumnView: NSView {
         self.ui = ui
         self.actions = actions
         self.favicons = favicons
+        let palette = (store.space(spaceID) ?? store.focusedSpace(window: ui.windowID)).theme.palette
         favorites = FavoritesGridView(spaceID: spaceID, store: store, ui: ui, actions: actions, favicons: favicons)
         header = SpaceHeaderView(spaceID: spaceID, store: store, ui: ui, actions: actions)
-        list = SpaceListView(spaceID: spaceID, store: store, ui: ui, actions: actions, favicons: favicons)
+        pinnedList = SpaceListView(spaceID: spaceID, scope: .pinned, store: store, ui: ui, actions: actions, favicons: favicons)
+        todayList = SpaceListView(spaceID: spaceID, scope: .today, store: store, ui: ui, actions: actions, favicons: favicons)
+        divider = SidebarSectionDividerView(list: todayList, colors: SidebarColors(palette))
         super.init(frame: .zero)
         wantsLayer = true
         favorites.onHeightChange = { [weak self] animated in self?.relayout(animated: animated) }
         header.onHiddenChange = { [weak self] in self?.relayout(animated: true) }
-        list.header = header
-        addSubview(list)
+        for list in [pinnedList, todayList] {
+            list.header = header
+            list.onContentHeightChange = { [weak self] in self?.contentHeightChanged() }
+        }
+        addSubview(pinnedList)
+        addSubview(divider)
+        addSubview(todayList)
         addSubview(favorites)
         addSubview(header)
+        // The band's drag sets the pins' height; a double-click goes back to the content's split.
+        divider.onResize = { [weak self] height in self?.resizeDivider(to: height) }
+        divider.onResizeEnded = { [weak self] in self?.commitDividerDrag() }
+        divider.onReset = { [weak self] in self?.resetDividerSplit() }
+        observeDivider()
+        NotificationCenter.default.addObserver(self, selector: #selector(scrollerStyleChanged),
+                                               name: NSScroller.preferredScrollerStyleDidChangeNotification, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -59,9 +94,65 @@ final class SpaceColumnView: NSView {
         }
     }
 
+    /// A pane's rows changed height: re-divide the column between them. No animation during a
+    /// drag, where the pinned placeholder's height must follow the pointer at once.
+    private func contentHeightChanged() {
+        if placing { needsLayout = true; return }
+        relayout(animated: ui.draggingID == nil)
+    }
+
+    /// The band's drag asked for a pinned height: follow the pointer without animation. Today
+    /// keeps its one row's room; the release stores the result in the window prefs.
+    private func resizeDivider(to height: CGFloat) {
+        draggedPinnedHeight = min(max(0, height), paneDragLimit)
+        place(animated: false)
+    }
+
+    /// The band's drag ended: what it set becomes the split windows.json keeps, for every space.
+    private func commitDividerDrag() {
+        guard let height = draggedPinnedHeight else { return }
+        draggedPinnedHeight = nil
+        if store.prefs.pinnedPaneHeight != Double(height) { store.prefs.pinnedPaneHeight = Double(height) }
+        place(animated: false)
+    }
+
+    /// Double-click on the band: back to the panes' own content deciding the split.
+    private func resetDividerSplit() {
+        draggedPinnedHeight = nil
+        if store.prefs.pinnedPaneHeight != nil { store.prefs.pinnedPaneHeight = nil }
+        place(animated: true)
+    }
+
+    @objc private func scrollerStyleChanged() { needsLayout = true }
+
     override func layout() {
         super.layout()
         place(animated: false)
+    }
+
+    /// The divider's Tidy state and whether Today has rows (its 18 pt band is hidden when not).
+    private func observeDivider() {
+        observeChanges(of: { [store, spaceID] () -> DividerState? in
+            guard let space = store.space(spaceID) else { return nil }
+            return DividerState(
+                hasToday: !store.children(of: space.todayContainerID).isEmpty,
+                tidy: store.tidyingSpaces.contains(spaceID) ? .running
+                    : TidyTabsService.shared.offers(spaceID, store: store) ? .offered : .none,
+                colors: SidebarColors(space.theme.palette),
+                pinnedPaneHeight: store.prefs.pinnedPaneHeight)
+        }, apply: { [weak self] state in
+            guard let self, let state else { return }
+            divider.apply(hasToday: state.hasToday, tidy: state.tidy, colors: state.colors)
+            if lastHasToday != state.hasToday {
+                lastHasToday = state.hasToday
+                needsLayout = true
+            }
+            // A drag in another space (or a reset) is stored once; every column re-places to it.
+            if lastStoredPaneHeight != state.pinnedPaneHeight {
+                lastStoredPaneHeight = state.pinnedPaneHeight
+                needsLayout = true
+            }
+        })
     }
 
     /// Arc's favorites sit beside its space pager, not on a page (AX tree, 25 Oct), so a swipe
@@ -84,6 +175,9 @@ final class SpaceColumnView: NSView {
     /// sides like the tiles (measured 1 Nov), the divider line 54.5 pt below. With the header
     /// hidden the line is 18.5 pt under the tiles, 15.5 pt under the URL field.
     private func place(animated: Bool) {
+        guard let space = store.space(spaceID) else { return }
+        placing = true
+        defer { placing = false }
         let w = bounds.width
         let fh = favorites.height(forWidth: w - 16)
         let set = { (v: NSView, f: NSRect) in if v.frame != f { animated ? (v.animator().frame = f) : (v.frame = f) } }
@@ -98,7 +192,184 @@ final class SpaceColumnView: NSView {
         set(header, NSRect(x: 8, y: base + 8, width: w - 16, height: header.isHidden ? 0 : 36))
         // The list's line sits 11.5 pt into it (3 pt inset, then halfway down the 18 pt divider).
         let top = base + (!header.isHidden ? (blank ? 41.5 : 43) : tiles == nil ? 4 : 7)
-        set(list, NSRect(x: 0, y: top, width: w, height: max(0, bounds.height - top)))
+        let hasToday = !store.children(of: space.todayContainerID).isEmpty
+        // A legacy scroller's gutter belongs to the column: with one pane overflowing and the
+        // other not, per-pane scrollers would make the two lists' rows 8 pt apart.
+        let inset: CGFloat = NSScroller.preferredScrollerStyle == .legacy ? 8 : 0
+        pinnedList.rowsInset = inset
+        todayList.rowsInset = inset
+        todayList.contentTopInset = hasToday ? 0 : 1
+        let pinnedContent = pinnedList.contentHeight(forWidth: w)
+        let todayContent = todayList.contentHeight(forWidth: w)
+        let area = max(0, bounds.height - top)
+        let dividerHeight = min(hasToday ? 18 : 0, area)
+        let available = area - dividerHeight
+        // A dragged height (or the one its release left in the window prefs) wins over the
+        // content split; Today keeps at least one row's room while it has tabs.
+        let dragLimit = max(0, available - (hasToday ? CraMetrics.rowHeight : 0))
+        // With no Today tabs the band is hidden and the pins fill their content; a height kept
+        // from an earlier drag comes back when Today has tabs again.
+        let manual = hasToday ? (draggedPinnedHeight ?? store.prefs.pinnedPaneHeight.map { CGFloat($0) }) : nil
+        paneDragLimit = dragLimit
+        let pinnedHeight = min(SidebarPaneBudget(available: available, pinnedContent: pinnedContent,
+                                                todayContent: todayContent,
+                                                pinnedOverride: manual.map { min(max(0, $0), dragLimit) }).pinned,
+                               available)
+        set(pinnedList, NSRect(x: 0, y: top, width: w, height: pinnedHeight))
+        set(divider, NSRect(x: 0, y: top + pinnedHeight, width: w - inset, height: dividerHeight))
+        set(todayList, NSRect(x: 0, y: top + pinnedHeight + dividerHeight,
+                              width: w, height: max(0, available - pinnedHeight)))
+        divider.pinnedHeight = pinnedHeight
+        if dividerHeight == 0 { divider.resetHover() }
+        divider.isHidden = dividerHeight == 0
+    }
+}
+
+// MARK: - Divider between the panes
+
+/// The 18 pt band between the pinned pane and Today. It does not scroll with either pane, and
+/// keeps the row's Tidy/Clear affordances and its drag target: dropping on its top half pins an
+/// item to the end of Pinned, its bottom half moves a pinned item to the top of Today. Dragging
+/// the band itself sets the pins' height (double-click returns to the content's split).
+@MainActor
+private final class SidebarSectionDividerView: NSView {
+    private let list: SpaceListView
+    private let row: DividerRowView
+    /// The drop this band resolved, so an exit after a pane took the drop over leaves it alone.
+    private var ownDrop: SidebarListDrop?
+    /// The column's pinned height from its last place: where a drag starts.
+    var pinnedHeight: CGFloat = 0
+    /// A drag's proposed pinned height, its release, and a double-click's reset.
+    var onResize: ((CGFloat) -> Void)?
+    var onResizeEnded: (() -> Void)?
+    var onReset: (() -> Void)?
+    /// The press a drag measures from, in window coordinates.
+    private var dragStart: (point: NSPoint, pinned: CGFloat)?
+
+    init(list: SpaceListView, colors: SidebarColors) {
+        self.list = list
+        row = DividerRowView(key: .divider, list: list, colors: colors)
+        super.init(frame: .zero)
+        addSubview(row)
+        registerForDraggedTypes([.craSidebarItem])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func layout() {
+        super.layout()
+        row.frame = bounds
+    }
+
+    func apply(hasToday: Bool, tidy: DividerTidy, colors: SidebarColors) {
+        row.setColors(colors)
+        row.apply(hasToday: hasToday, tidy: tidy)
+    }
+
+    func resetHover() { row.isHovered = false }
+
+    // The row is not in a list, so the list's one hover pass never reaches it.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for t in trackingAreas where t.owner === self { removeTrackingArea(t) }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .cursorUpdate, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { row.isHovered = true }
+    override func mouseExited(with event: NSEvent) { row.isHovered = false }
+    override func cursorUpdate(with event: NSEvent) { NSCursor.resizeUpDown.set() }
+
+    // MARK: Resize
+
+    // Clear and Tidy keep their clicks; any other press on the band starts a resize.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        return hit === row ? self : hit
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .resizeUpDown)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard event.clickCount < 2 else {
+            dragStart = nil
+            onReset?()
+            return
+        }
+        dragStart = (event.locationInWindow, pinnedHeight)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = dragStart else { return }
+        // The window's y grows upward: dragging the band down makes the pins taller.
+        onResize?(start.pinned + start.point.y - event.locationInWindow.y)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard dragStart != nil else { return }
+        dragStart = nil
+        onResizeEnded?()
+    }
+
+    // MARK: Drop
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { updateDrop(sender) }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { updateDrop(sender) }
+    override func draggingExited(_ sender: NSDraggingInfo?) { clearDrop() }
+    override func draggingEnded(_ sender: NSDraggingInfo) { clearDrop() }
+
+    private func updateDrop(_ info: NSDraggingInfo) -> NSDragOperation {
+        if list.ui.draggingID == nil, let data = info.draggingPasteboard.data(forType: .craSidebarItem),
+           let d = try? JSONDecoder().decode(SidebarDragItem.self, from: data) {
+            list.ui.draggingID = d.id
+        }
+        guard let id = list.ui.draggingID, let space = list.store.space(list.spaceID), list.store.item(id) != nil else {
+            clearDrop()
+            return []
+        }
+        let toPins = convert(info.draggingLocation, from: nil).y < bounds.midY
+        var isPinned = false
+        if case .pinned? = list.store.rootContainer(of: id) { isPinned = true }
+        // The band only carries an item across; its own pane keeps the drag for reordering.
+        guard toPins != isPinned else {
+            clearDrop()
+            return []
+        }
+        let parent = toPins ? space.pinnedContainerID : space.todayContainerID
+        let count = list.store.children(of: parent).count
+        let drop = SidebarListDrop(draggedID: id, scope: toPins ? .pinned : .today, fromDivider: true,
+                                   target: .insert(parent: parent, index: toPins ? count : 0))
+        if list.ui.listDrop != drop { list.ui.listDrop = drop }
+        ownDrop = drop
+        return .move
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        // The shared drop may belong to a pane by the time the mouse comes up.
+        guard let drop = ownDrop, list.ui.listDrop == drop, drop.target != nil else {
+            ownDrop = nil
+            return false
+        }
+        list.applyDrop(drop)
+        if list.store.settings.hapticFeedbackOnReorder {
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .drawCompleted)
+        }
+        list.ui.listDrop = nil
+        list.ui.draggingID = nil
+        ownDrop = nil
+        return true
+    }
+
+    private func clearDrop() {
+        guard let drop = ownDrop else { return }
+        ownDrop = nil
+        if list.ui.listDrop == drop { list.ui.listDrop = nil }
     }
 }
 

@@ -2501,11 +2501,16 @@ enum DividerTidy: Equatable {
     case none, offered, running
 }
 
+/// The divider's 1 pt line takes no clicks: the band that hosts it handles the resize drag.
+private final class DividerLineView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 /// The line between pinned and Today; "Clear" shows on hover, and "Tidy" before it once Tidy Tabs
 /// can sort Today (Arc 1.171: UnpinnedSectionHeaderCellView with SidebarTidyButton, a
 /// SquiggleDivider while it works).
 final class DividerRowView: SidebarRowView {
-    private let line = NSView()
+    private let line = DividerLineView()
     private var clear: ClearButton?
     private var tidyButton: TidyButton?
     private let squiggle = SquiggleLayer()
@@ -2632,6 +2637,10 @@ final class DividerRowView: SidebarRowView {
 
         override var fittingSize: NSSize { label.frame.size }
         override var mouseDownCanMoveWindow: Bool { false }
+        override func resetCursorRects() {
+            super.resetCursorRects()
+            addCursorRect(bounds, cursor: .arrow)
+        }
         override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
         override func mouseDown(with event: NSEvent) {}
         override func mouseUp(with event: NSEvent) {
@@ -2863,6 +2872,10 @@ final class TidyButton: NSView {
     override func mouseEntered(with event: NSEvent) { hovering = true }
     override func mouseExited(with event: NSEvent) { hovering = false }
     override var mouseDownCanMoveWindow: Bool { false }
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .arrow)
+    }
     override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
     override func mouseDown(with event: NSEvent) {}
     override func mouseUp(with event: NSEvent) {

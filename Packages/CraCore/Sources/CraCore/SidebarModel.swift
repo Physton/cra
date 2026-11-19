@@ -869,6 +869,9 @@ public struct WindowSession: Codable, Equatable, Identifiable {
 
 public struct WindowPrefs: Codable, Equatable {
     public var sidebarWidth: Double = 328
+    /// The height the user dragged the band between the pinned pane and Today to, in points below
+    /// the list's top. nil while the split follows the panes' content (SidebarPaneBudget).
+    public var pinnedPaneHeight: Double?
     public var expandedFolders: Set<UUID> = []
     public var collapsedPinnedSpaces: Set<UUID> = []
     /// Arc's topAppsEmptyStateDismissedForProfiles: favorites containers whose empty-state card
