@@ -10,22 +10,25 @@ struct ExtensionIconsTests {
         #expect(ExtensionIcons.files(icons, points: 16) == ["icons/16.png", "icons/48.png"])
     }
 
-    @Test(.bug("https://github.com/VictorKildahl/cra/issues/349"), arguments: [
-        // An exact 2x file is the one.
-        (["16": "a", "32": "b", "48": "c", "128": "d"], ["a", "b"]),
-        // Only large files: the smallest that is big enough serves both scales.
-        (["48": "c", "128": "d"], ["c"]),
-        (["128": "d"], ["d"]),
-        // Only a small one: it is all there is (MATCH_SMALLER).
-        (["16": "a"], ["a"]),
-        // MV2 browser actions' 19 and 38 px.
-        (["19": "s", "38": "l"], ["s", "l"]),
-        // Keys that aren't sizes are ignored; nothing left is no icon.
-        (["16": "a", "large": "x", "0": "z"], ["a"]),
-        ([:], []),
-    ] as [([String: String], [String])])
-    func choice(icons: [String: String], files: [String]) {
-        #expect(ExtensionIcons.files(icons, points: 16) == files)
+    @Test(.bug("https://github.com/VictorKildahl/cra/issues/349"))
+    func choice() {
+        let cases: [([String: String], [String])] = [
+            // An exact 2x file is the one.
+            (["16": "a", "32": "b", "48": "c", "128": "d"], ["a", "b"]),
+            // Only large files: the smallest that is big enough serves both scales.
+            (["48": "c", "128": "d"], ["c"]),
+            (["128": "d"], ["d"]),
+            // Only a small one: it is all there is (MATCH_SMALLER).
+            (["16": "a"], ["a"]),
+            // MV2 browser actions' 19 and 38 px.
+            (["19": "s", "38": "l"], ["s", "l"]),
+            // Keys that aren't sizes are ignored; nothing left is no icon.
+            (["16": "a", "large": "x", "0": "z"], ["a"]),
+            ([:], []),
+        ]
+        for (icons, files) in cases {
+            #expect(ExtensionIcons.files(icons, points: 16) == files)
+        }
     }
 
     @Test(.bug("https://github.com/VictorKildahl/cra/issues/349"))
