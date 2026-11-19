@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     /// Browser windows, one per WindowSession. Closing the last one only hides it.
     private(set) var mainWindows: [MainWindowController] = []
+    /// Windows going back into full screen, one at a time (FullScreenRestore).
+    private var fullScreenRestore = FullScreenRestore()
     /// The browser window in use: the key one, or the one last key.
     var main: MainWindowController! {
         mainWindows.first { $0.windowID == store.activeWindowID } ?? mainWindows.first
@@ -130,7 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         } else {
             // The window in use last comes up in front.
             for w in mainWindows.reversed() { w.showWindow(nil) }
-            for w in mainWindows { w.enterSavedFullScreen() }
+            restoreSavedFullScreens()
             // As ⌘T: the command bar makes the new tab, Esc leaves the window empty.
             if startOnNewTab { DispatchQueue.main.async { [weak self] in self?.main.openCommandBar(.newTab) } }
         }
@@ -718,6 +720,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             w.bringBack()
             if w !== c { w.window?.orderFront(nil) }
         }
+        // As after a launch: the full-screen ones go back one at a time.
+        DispatchQueue.main.async { [weak self] in self?.restoreSavedFullScreens() }
+    }
+
+    /// Windows that quit in full screen go back into it one at a time: macOS fails a window's
+    /// request while another window's full-screen transition is running
+    /// (windowDidFailToEnterFullScreen), so when every window asked at once at launch only the
+    /// first one got there.
+    func restoreSavedFullScreens() {
+        for c in mainWindows {
+            guard store.window(c.windowID).fullScreen, let w = c.window, w.isVisible,
+                  !w.styleMask.contains(.fullScreen) else { continue }
+            fullScreenRestore.add(c.windowID)
+        }
+        enterNextSavedFullScreen()
+    }
+
+    private func enterNextSavedFullScreen() {
+        while let id = fullScreenRestore.next() {
+            guard let w = mainWindows.first(where: { $0.windowID == id })?.window, w.isVisible,
+                  !w.styleMask.contains(.fullScreen) else {
+                // Gone, or already there: nothing to wait for.
+                fullScreenRestore.ended(entered: true)
+                continue
+            }
+            w.toggleFullScreen(nil)
+            return
+        }
+    }
+
+    /// From MainWindowController: a restored window's full-screen transition ended (`entered`
+    /// false: AppKit failed the request).
+    func fullScreenRestoreEnded(_ id: UUID, entered: Bool) {
+        guard fullScreenRestore.current == id else { return }
+        fullScreenRestore.ended(entered: entered)
+        // Outside the transition that just ended: the next request would fail inside it.
+        DispatchQueue.main.async { [weak self] in self?.enterNextSavedFullScreen() }
     }
 
     /// Any window of Cra's about to show: the Dock icon and the app menu come back first, or the

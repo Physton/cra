@@ -54,6 +54,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, BrowserM
     /// Whether a touch over the sidebar hides the lists' knob (#77), or leaves it showing (#544).
     private var listKnob = ListKnobGate()
     private var enteredFullscreenForContent = false
+    /// The frame the window last had while not in full screen: what windows.json keeps while it
+    /// is in full screen, so a window quit there comes back to the display it was on.
+    private var windowedFrame: NSRect?
     /// The tab whose page (a video) is in element fullscreen.
     private var contentFullscreenTab: UUID?
     private var lastSidebarVisible = true
@@ -140,6 +143,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, BrowserM
         } else {
             window.center()
         }
+        windowedFrame = window.frame
         window.delegate = self
         sidebarUI.windowID = session.id
 
@@ -4904,6 +4908,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, BrowserM
 
     // The sidebar header's toggle moves into the traffic lights' place while they are gone (Arc).
     func windowWillEnterFullScreen(_ notification: Notification) {
+        // A move or resize just before the green button settles in windows.json now: entering
+        // full screen changes the window's frame, and saveFrameNow keeps a full-screen one out.
+        if let windowedFrame { store.updateWindow(windowID) { $0.frame = NSStringFromRect(windowedFrame) } }
         sidebarUI.windowFullscreen = true; shell.windowFullscreen = true
         (window as? CraWindow)?.fullScreenChanged()
     }
@@ -4914,10 +4921,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, BrowserM
         // Remembered for the next launch (#426), unless a page's video took the window there.
         if !enteredFullscreenForContent { store.updateWindow(windowID) { $0.fullScreen = true } }
         runAfterFullScreen()
+        // The launch restore's next window waits for this transition to end.
+        app.fullScreenRestoreEnded(windowID, entered: true)
     }
-    func windowDidFailToEnterFullScreen(_ window: NSWindow) { runAfterFullScreen() }
+    /// AppKit refuses to enter full screen while another window's transition runs. The launch
+    /// restore asks again once, after the windows behind this one.
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) {
+        runAfterFullScreen()
+        app.fullScreenRestoreEnded(windowID, entered: false)
+    }
     func windowDidExitFullScreen(_ notification: Notification) {
         (window as? CraWindow)?.fullScreenChanged()
+        if let window, !window.styleMask.contains(.fullScreen) { windowedFrame = window.frame }
         // Put away into the menu bar, it leaves full screen only to order out: it comes back in it.
         if !isPutAway { store.updateWindow(windowID) { $0.fullScreen = false } }
         // Left with the green button or ⌃⌘F while a video was fullscreen: the page leaves too.
@@ -5038,6 +5053,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, BrowserM
     /// The frame lives in the store's observed prefs, which every sidebar row reads (selection):
     /// it is stored once a resize or move settles, not on every step of it.
     private func saveFrame() {
+        if let window, !window.styleMask.contains(.fullScreen) { windowedFrame = window.frame }
         frameSaveWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.saveFrameNow() }
         frameSaveWork = work
@@ -5049,8 +5065,30 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, BrowserM
     func saveFrameNow() {
         frameSaveWork?.cancel()
         frameSaveWork = nil
-        guard let window, !window.styleMask.contains(.fullScreen) else { return }
+        guard let window else { return }
+        guard !window.styleMask.contains(.fullScreen) else {
+            saveFullScreenWindowedFrame()
+            return
+        }
+        windowedFrame = window.frame
         store.updateWindow(windowID) { $0.frame = NSStringFromRect(window.frame) }
+    }
+
+    /// A window quit in full screen keeps the windowed frame on the display it is full screen on:
+    /// a full-screen Space carried to another display in Mission Control leaves `window.frame`
+    /// as that whole display, and the frame from before is then on the wrong one.
+    private func saveFullScreenWindowedFrame() {
+        guard let window, let screen = window.screen else { return }
+        let saved = store.window(windowID).frame.map { NSRectFromString($0) }
+        let frame = FullScreenWindowFrame.windowedFrame(windowedFrame ?? saved ?? window.frame, saved: saved, on: screen.frame)
+        store.updateWindow(windowID) { $0.frame = NSStringFromRect(frame) }
+    }
+
+    /// A full-screen Space carried to another display belongs there at the next launch.
+    func windowDidChangeScreen(_ notification: Notification) {
+        guard let changed = notification.object as? NSWindow, changed === window,
+              changed.styleMask.contains(.fullScreen) else { return }
+        saveFullScreenWindowedFrame()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -5124,8 +5162,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, BrowserM
         guard isPutAway else { return }
         isPutAway = false
         refresh()
-        // Called as the window is about to show (browserWindowWillShow).
-        DispatchQueue.main.async { [weak self] in self?.enterSavedFullScreen() }
+        // Called as the window is about to show (browserWindowWillShow), which puts the windows
+        // that were in full screen back one at a time (AppDelegate's restoreSavedFullScreens).
     }
 
     /// A window that was in full screen when Cra quit (or went to the menu bar) goes back into it

@@ -1,0 +1,11 @@
+# Two windows that quit in full screen come back to it: macOS fails a window's request to enter
+# full screen while another window's transition is running, so the launch restore asks for one
+# window at a time. A scenario has only one display; both windows share it, and each still gets a
+# full-screen Space of its own.
+requires screen
+seed settings.json {"hasSeenImportPrompt": true, "toolbarDefaultMigrated": true, "showToolbar": false}
+seed windows.json {"windows":[{"fullScreen":true},{"fullScreen":true}]}
+wait 6
+cra://debug?windowState=restored
+expect-log window state restored: main0 fullscreen=1
+expect-log window state restored: main1 fullscreen=1
