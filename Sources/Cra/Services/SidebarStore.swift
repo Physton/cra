@@ -670,6 +670,15 @@ final class SidebarStore {
         LinkTabPlacement.belowSource(source, afterEarlierLinks: afterEarlierLinks) { self.items[$0] }
     }
 
+    /// Where a tab a link opened goes: right below its Today source tab (Arc), else `(nil, nil)`
+    /// so `createTab` takes its default place (Settings ▸ Tabs ▸ New tabs at the top). A tab a
+    /// page's popup opens (`target=_blank`, `window.open`) shares it, so both paths land alike.
+    /// One rule with `linkTabSlot` above, which the link and popup paths call.
+    func linkTabPlacement(from source: UUID?) -> (parent: UUID?, index: Int?) {
+        guard let source, let slot = linkTabSlot(below: source, afterEarlierLinks: false) else { return (nil, nil) }
+        return (slot.parent, slot.index)
+    }
+
     /// What Back does on tab `id`, whose page `canGoBack` or not: a tab a link opened, with no
     /// page behind, closes to the tab it came from while that one is still in the sidebar (#273).
     /// `swipe`: a two-finger swipe back over the page asks (#370).

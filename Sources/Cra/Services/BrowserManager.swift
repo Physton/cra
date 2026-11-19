@@ -1775,10 +1775,13 @@ final class BrowserManager: NSObject, @preconcurrency CraBrowserDelegate {
             return host
         }
         let sourceSpace = source.flatMap { store.spaceID(ofItem: $0) }
-        // A ⌘-click or middle click goes where new tabs go, or with "Open background tabs below the
-        // current tab" on right below `source`, after the tabs it opened before (#532).
-        let slot = background && store.settings.backgroundTabsBelowCurrent
-            ? source.flatMap { store.linkTabSlot(below: $0, afterEarlierLinks: true) } : nil
+        // A target=_blank link and window.open are tabs like any other: from a Today tab the
+        // popup's tab goes right below it, not at the top of Today. A ⌘-click or middle click with
+        // "Open background tabs below the current tab" on goes after the tabs `source` opened
+        // before (#532).
+        let slot = source.flatMap {
+            store.linkTabSlot(below: $0, afterEarlierLinks: background && store.settings.backgroundTabsBelowCurrent)
+        }
         let tab = store.createTab(url: url, in: sourceSpace, select: !background, parent: slot?.parent, index: slot?.index,
                                   window: windowID, referrer: source)
         if background { store.markUnread(tab.id, true) }

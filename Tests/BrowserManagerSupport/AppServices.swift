@@ -32,7 +32,7 @@ typealias PermissionPopover = AppDialog
 
 // Unrelated shell services required to typecheck the complete production manager.
 // The tab store deliberately remains observable so stale callbacks can be asserted.
-struct TestTab { var url: String; var savedTitle = ""; var muted = false; var faviconKey: String?; var themeColor: String?; var activeTabBeforeCreationID: UUID? }
+struct TestTab { var url: String; var savedTitle = ""; var muted = false; var faviconKey: String?; var themeColor: String?; var activeTabBeforeCreationID: UUID?; var referrerID: UUID? }
 struct TestItem {
     let id: UUID
     var tab: TestTab?
@@ -96,10 +96,22 @@ enum TestRoot { case today }
         linkPanes.append(url)
         return createTab(url: url)
     }
-    func rootContainer(of: UUID) -> TestRoot? { nil }
+    func rootContainer(of id: UUID) -> TestRoot? { todayItems.contains(id) ? .today : nil }
+    /// The tabs the fake store says live in Today, for the link placement's root check.
+    var todayItems: Set<UUID> = []
     /// The slot below a link's source tab (#532); CraCore's LinkTabPlacementTests pin where it is.
+    /// Mirrors the real store's rule for a Today source: right below it, after the tabs it opened.
     struct LinkSlot { let parent: UUID; let index: Int }
-    func linkTabSlot(below source: UUID, afterEarlierLinks: Bool) -> LinkSlot? { nil }
+    func linkTabSlot(below source: UUID, afterEarlierLinks: Bool) -> LinkSlot? {
+        guard let it = items[source], it.isTab, let parentID = it.parentID,
+              let parent = items[parentID], let at = parent.children.firstIndex(of: source),
+              todayItems.contains(source) else { return nil }
+        var index = at + 1
+        if afterEarlierLinks {
+            while index < parent.children.count, items[parent.children[index]]?.tab?.referrerID == source { index += 1 }
+        }
+        return LinkSlot(parent: parentID, index: index)
+    }
     func updateTab(_ id: UUID, url: String? = nil, title: String? = nil) {
         if let url { items[id]?.tab?.url = url }
         if let title { items[id]?.tab?.savedTitle = title }
@@ -117,9 +129,21 @@ enum TestRoot { case today }
     @discardableResult
     func createTab(url: String, in space: UUID? = nil, select: Bool = false,
                    parent: UUID? = nil, index: Int? = nil, window: UUID? = nil, referrer: UUID? = nil) -> TestItem {
-        let item = TestItem(id: UUID(), tab: TestTab(url: url))
+        var tab = TestTab(url: url)
+        tab.referrerID = referrer
+        let item = TestItem(id: UUID(), tab: tab, parentID: parent)
         items[item.id] = item
+        if let parent, var p = items[parent] {
+            p.children.insert(item.id, at: min(max(0, index ?? p.children.count), p.children.count))
+            items[parent] = p
+        }
         return item
+    }
+    /// The real store's rule, so a link's tab in the fake lands where the sidebar would put it.
+    func linkTabPlacement(from source: UUID?) -> (parent: UUID?, index: Int?) {
+        guard let source, let it = items[source], let parent = it.parentID,
+              case .today? = rootContainer(of: source) else { return (nil, nil) }
+        return (parent, (items[parent]?.children.firstIndex(of: source) ?? -1) + 1)
     }
 }
 /// The extensions turned on in the Default profile.

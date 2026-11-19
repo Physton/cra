@@ -95,6 +95,7 @@ enum StoreTests {
         revealInSidebar()
         oneWindowAtLaunch()
         openLinkInSplit()
+        linkTabPlacement()
         fullSplitTakesNoMorePanes()
         backToReferrer()
         recentTabsTakeBackgroundTabs()
@@ -3048,6 +3049,36 @@ enum StoreTests {
                "a pinned tab stays where it is: the split goes in Today with a copy of its page, as Add Split View does")
         expect(store.openLinkInSplit("https://example.com/x", from: UUID(), window: main) == nil, "no tab, no pane")
         expect(store.integrityProblems().isEmpty, "and the sidebar stays sound")
+    }
+
+    /// Where a link's tab goes, for the link tab and the popup tab alike: right below its Today
+    /// source (Arc), in its folder when it is in one; a pinned source or no source keeps the
+    /// default place (Settings ▸ Tabs ▸ New tabs at the top).
+    @MainActor
+    private static func linkTabPlacement() {
+        let store = AppComposition(clock: ManualScheduler()).store
+        store.settings.newTabsAtTop = true
+        let sid = store.createSpace(title: "Link Placement", emoji: "🔗").id
+        let today = store.space(sid)!.todayContainerID
+        let a = store.createTab(url: "https://example.com/a", in: sid, select: false)
+        let b = store.createTab(url: "https://example.com/b", in: sid, select: false)
+        expect(store.children(of: today).map(\.id) == [b.id, a.id], "new tabs start at the top")
+        let place = store.linkTabPlacement(from: a.id)
+        expect(place.parent == today && place.index == 2, "a Today tab's link goes right below it")
+        let link = store.createTab(url: "https://example.com/link", in: sid, select: false, parent: place.parent, index: place.index)
+        expect(store.children(of: today).map(\.id) == [b.id, a.id, link.id], "and lands there")
+
+        let folder = store.createFolder(named: "Reading", in: today)
+        let inFolder = store.createTab(url: "https://example.com/in-folder", in: sid, select: false, parent: folder.id)
+        let folderPlace = store.linkTabPlacement(from: inFolder.id)
+        expect(folderPlace.parent == folder.id && folderPlace.index == 1,
+               "a Today folder's tab keeps its link in the folder, right below it")
+
+        let pinned = store.createTab(url: "https://example.com/pinned", in: sid, pinned: true, select: false)
+        let pinnedPlace = store.linkTabPlacement(from: pinned.id)
+        let noPlace = store.linkTabPlacement(from: nil)
+        expect(pinnedPlace.parent == nil && pinnedPlace.index == nil && noPlace.parent == nil && noPlace.index == nil,
+               "a pinned tab's link, and a link with no source, keep the default place")
     }
 
     // promise: #498

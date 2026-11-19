@@ -74,6 +74,29 @@ enum BrowserManagerLifecycleTests {
         store.settings.littleWindowOnOptionCommandClick = false
     }
 
+    /// A link that asks for a window (target=_blank, window.open) takes the place a link's tab
+    /// takes: right below its Today source (Arc), not at the top of Today. Chromium hands these
+    /// to popupHostForURL; a WebKit page's target=_blank already went through
+    /// requestsNewTabWithURL → openLinkTab.
+    @MainActor
+    private static func linkTabBelowSourceCase() {
+        let store = SidebarStore()
+        let manager = BrowserManager(store: store, favicons: FaviconCache(), container: NSView())
+        let today = UUID()
+        store.items[today] = TestItem(id: today, tab: nil)
+        let first = store.createTab(url: "https://example.test/first", parent: today)
+        let source = store.createTab(url: "https://example.test/source", parent: today)
+        store.todayItems = [first.id, source.id]
+        let browser = manager.ensureRuntime(for: source.id)!.browser
+        let popup = manager.browser(browser, popupHostForURL: "https://example.test/popup", inBackground: true)
+        expect(popup != nil, "the popup gets a host")
+        let children = store.items[today]?.children ?? []
+        expect(children.count == 3 && children[0] == first.id && children[1] == source.id
+               && store.items[children[2]]?.parentID == today
+               && store.items[children[2]]?.tab?.url == "https://example.test/popup",
+               "the popup's tab lands right below its Today source, not at the top of Today")
+    }
+
     @MainActor
     static func main() async {
         downloadSourceAdoptionCase()
@@ -129,6 +152,7 @@ enum BrowserManagerLifecycleTests {
         await optionClickSplitCase(manager, observer, live: replacement.browser, closed: old.browser, tab: id)
         pageViewTabCase(manager, replacement, tab: id)
         optionCommandLittleWindowCase(manager, store, observer, live: replacement.browser, closed: old.browser, tab: id)
+        linkTabBelowSourceCase()
 
         let retainedID = store.createTab(url: "https://example.test/retained").id
         weak var retainedBrowser = manager.ensureRuntime(for: retainedID)?.browser
